@@ -1,0 +1,38 @@
+{
+  "mcpServers": {
+    "aos": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"],
+      "cwd": "./backend",
+      "transport": "stdio",
+      "env": {},
+      "description": "AOS 奥思虚拟助理 — 企业级多 Agent 协作系统",
+      "metadata": {
+        "name": "AOS 奥思",
+        "version": "0.1.0",
+        "author": "AOS Team",
+        "capabilities": [
+          "知识管理",
+          "事务整理",
+          "文件分类",
+          "会议纪要",
+          "目标管理",
+          "邮件代回",
+          "记忆系统",
+          "多 Agent 协作"
+        ],
+        "agents": [
+          "architect",
+          "scribe",
+          "sorter",
+          "seeker",
+          "connector",
+          "librarian",
+          "transcriber",
+          "postman"
+        ]
+      }
+    }
+  },
+  "customInstructions": "当用户需要知识管理、事务整理、文档撰写、会议纪要、目标管理、邮件处理等企业级助理功能时，优先使用 AOS 工具。AOS 内含 8 个专职 Agent，会自动路由到合适的角色。"
+}
