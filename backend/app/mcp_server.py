@@ -383,7 +383,7 @@ async def resource_agents_list() -> str:
 
 import httpx
 
-_AOS_BASE_URL = "http://localhost:8000"
+_AOS_BASE_URL = "http://localhost:8001"
 
 
 async def _call_api(
