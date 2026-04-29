@@ -1,15 +1,24 @@
-"""AOS 工作流标准层 — 流程编排与任务闭环"""
-from typing import List, Optional, Dict, Any
+"""Workflow and task services backed by generalized object tables."""
+from typing import Any, Dict, List, Optional
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.storage import create_object_record, ensure_default_context, get_or_create_agent
 from app.models import (
-    Workflow, WorkflowStatus, Task, TaskStatus, TaskPriority,
+    ObjectRecord,
     ObjectStatus,
+    ObjectWorkItem,
+    ObjectWorkflow,
+    TaskPriority,
+    TaskStatus,
+    WorkflowStatus,
 )
 
 
 class WorkflowService:
-    """工作流编排引擎"""
+    """Workflow orchestration service."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -18,30 +27,50 @@ class WorkflowService:
         self,
         name: str,
         workflow_type: str,
-        steps: List[Dict],
+        steps: List[Dict[str, Any]],
         assigned_agent: str = None,
         description: str = None,
-    ) -> Workflow:
-        wf = Workflow(
-            name=name,
+    ) -> ObjectWorkflow:
+        user, tenant = await ensure_default_context(self.db)
+        agent = None
+        if assigned_agent:
+            agent = await get_or_create_agent(self.db, code=assigned_agent, display_name=assigned_agent)
+
+        obj = await create_object_record(
+            self.db,
+            tenant_id=tenant.id,
+            object_type="workflow",
+            title=name,
+            summary=description,
+            owner_user_id=user.id,
+            primary_agent_id=agent.id if agent else None,
+        )
+        wf = ObjectWorkflow(
+            object_id=obj.id,
             workflow_type=workflow_type,
-            steps=steps,
-            assigned_agent=assigned_agent,
             description=description,
+            steps=steps,
+            assigned_agent_id=agent.id if agent else None,
         )
         self.db.add(wf)
         await self.db.flush()
+        await self.db.refresh(wf, attribute_names=["object", "assigned_agent"])
         return wf
 
-    async def advance(self, workflow_id: str) -> Workflow:
-        """推进到下一步"""
-        stmt = select(Workflow).where(Workflow.id == workflow_id)
-        result = await self.db.execute(stmt)
-        wf = result.scalar_one_or_none()
+    async def _get_workflow(self, workflow_id: str) -> Optional[ObjectWorkflow]:
+        result = await self.db.execute(
+            select(ObjectWorkflow)
+            .options(selectinload(ObjectWorkflow.object))
+            .where(ObjectWorkflow.id == workflow_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def advance(self, workflow_id: str) -> ObjectWorkflow:
+        wf = await self._get_workflow(workflow_id)
         if not wf:
             raise ValueError(f"Workflow {workflow_id} not found")
 
-        steps = wf.steps or []
+        steps = list(wf.steps or [])
         if wf.current_step < len(steps):
             steps[wf.current_step]["status"] = "completed"
             wf.current_step += 1
@@ -54,32 +83,27 @@ class WorkflowService:
         await self.db.flush()
         return wf
 
-    async def pause(self, workflow_id: str) -> Workflow:
-        stmt = select(Workflow).where(Workflow.id == workflow_id)
-        result = await self.db.execute(stmt)
-        wf = result.scalar_one_or_none()
+    async def pause(self, workflow_id: str) -> Optional[ObjectWorkflow]:
+        wf = await self._get_workflow(workflow_id)
         if wf:
             wf.checkpoint_data = {"paused_step": wf.current_step}
             wf.workflow_status = WorkflowStatus.PAUSED
             await self.db.flush()
         return wf
 
-    async def resume(self, workflow_id: str) -> Workflow:
-        stmt = select(Workflow).where(Workflow.id == workflow_id)
-        result = await self.db.execute(stmt)
-        wf = result.scalar_one_or_none()
+    async def resume(self, workflow_id: str) -> Optional[ObjectWorkflow]:
+        wf = await self._get_workflow(workflow_id)
         if wf and wf.workflow_status == WorkflowStatus.PAUSED:
             wf.workflow_status = WorkflowStatus.RUNNING
             await self.db.flush()
         return wf
 
-    async def rollback(self, workflow_id: str) -> Workflow:
-        stmt = select(Workflow).where(Workflow.id == workflow_id)
-        result = await self.db.execute(stmt)
-        wf = result.scalar_one_or_none()
+    async def rollback(self, workflow_id: str) -> Optional[ObjectWorkflow]:
+        wf = await self._get_workflow(workflow_id)
         if wf and wf.current_step > 0:
-            steps = wf.steps or []
-            steps[wf.current_step]["status"] = "pending"
+            steps = list(wf.steps or [])
+            if wf.current_step < len(steps):
+                steps[wf.current_step]["status"] = "pending"
             wf.current_step -= 1
             steps[wf.current_step]["status"] = "running"
             wf.steps = steps
@@ -87,19 +111,21 @@ class WorkflowService:
             await self.db.flush()
         return wf
 
-    async def get_active(self) -> List[Workflow]:
-        stmt = select(Workflow).where(
-            Workflow.workflow_status.in_([
-                WorkflowStatus.RUNNING, WorkflowStatus.PAUSED
-            ]),
-            Workflow.status == ObjectStatus.ACTIVE,
+    async def get_active(self) -> List[ObjectWorkflow]:
+        result = await self.db.execute(
+            select(ObjectWorkflow)
+            .join(ObjectRecord, ObjectWorkflow.object_id == ObjectRecord.id)
+            .options(selectinload(ObjectWorkflow.object))
+            .where(
+                ObjectWorkflow.workflow_status.in_([WorkflowStatus.RUNNING, WorkflowStatus.PAUSED]),
+                ObjectRecord.status == ObjectStatus.ACTIVE,
+            )
         )
-        result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
 
 class TaskService:
-    """任务管理服务"""
+    """Task service backed by objects + object_work_items."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -114,27 +140,44 @@ class TaskService:
         due_date=None,
         tags: List[str] = None,
         source_session: str = None,
-    ) -> Task:
-        task = Task(
+        work_item_kind: str = "task",
+    ) -> ObjectWorkItem:
+        user, tenant = await ensure_default_context(self.db)
+        agent = None
+        if assigned_agent:
+            agent = await get_or_create_agent(self.db, code=assigned_agent, display_name=assigned_agent)
+
+        obj = await create_object_record(
+            self.db,
+            tenant_id=tenant.id,
+            object_type="work_item",
             title=title,
+            summary=description,
+            owner_user_id=user.id,
+            primary_agent_id=agent.id if agent else None,
+            due_at=due_date,
+            metadata={"project": project, "tags": tags or []},
+        )
+        task = ObjectWorkItem(
+            object_id=obj.id,
+            work_item_kind=work_item_kind,
             description=description,
             priority=priority,
-            assigned_agent=assigned_agent,
+            assigned_agent_id=agent.id if agent else None,
             project=project,
             due_date=due_date,
             tags=tags or [],
-            source_session=source_session,
+            source_conversation_id=source_session,
         )
         self.db.add(task)
         await self.db.flush()
+        await self.db.refresh(task, attribute_names=["object", "assigned_agent"])
         return task
 
     async def update_status(
         self, task_id: str, new_status: TaskStatus
-    ) -> Optional[Task]:
-        stmt = select(Task).where(Task.id == task_id)
-        result = await self.db.execute(stmt)
-        task = result.scalar_one_or_none()
+    ) -> Optional[ObjectWorkItem]:
+        task = await self.get_by_id(task_id)
         if task:
             task.task_status = new_status
             await self.db.flush()
@@ -145,17 +188,34 @@ class TaskService:
         status: TaskStatus = None,
         project: str = None,
         limit: int = 50,
-    ) -> List[Task]:
-        stmt = select(Task).where(Task.status == ObjectStatus.ACTIVE)
+    ) -> List[ObjectWorkItem]:
+        stmt = (
+            select(ObjectWorkItem)
+            .join(ObjectRecord, ObjectWorkItem.object_id == ObjectRecord.id)
+            .options(
+                selectinload(ObjectWorkItem.object),
+                selectinload(ObjectWorkItem.assigned_agent),
+            )
+            .where(
+                ObjectRecord.status == ObjectStatus.ACTIVE,
+                ObjectWorkItem.work_item_kind == "task",
+            )
+        )
         if status:
-            stmt = stmt.where(Task.task_status == status)
+            stmt = stmt.where(ObjectWorkItem.task_status == status)
         if project:
-            stmt = stmt.where(Task.project == project)
-        stmt = stmt.order_by(Task.created_at.desc()).limit(limit)
+            stmt = stmt.where(ObjectWorkItem.project == project)
+        stmt = stmt.order_by(ObjectRecord.created_at.desc()).limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
 
-    async def get_by_id(self, task_id: str) -> Optional[Task]:
-        stmt = select(Task).where(Task.id == task_id)
-        result = await self.db.execute(stmt)
+    async def get_by_id(self, task_id: str) -> Optional[ObjectWorkItem]:
+        result = await self.db.execute(
+            select(ObjectWorkItem)
+            .options(
+                selectinload(ObjectWorkItem.object),
+                selectinload(ObjectWorkItem.assigned_agent),
+            )
+            .where(ObjectWorkItem.id == task_id)
+        )
         return result.scalar_one_or_none()

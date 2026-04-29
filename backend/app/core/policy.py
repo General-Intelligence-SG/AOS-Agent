@@ -1,14 +1,21 @@
-"""AOS 策略标准层 — 安全门控与权限控制"""
-from typing import List, Optional, Dict, Any
+"""Policy and audit services backed by generalized tables."""
+from typing import Any, Dict, List, Optional
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.storage import create_object_record, ensure_default_context, get_agent_by_code, get_or_create_agent
 from app.models import (
-    Policy, PolicyAction, RiskLevel, ObjectStatus,
-    AuditRecord,
+    AuditLog,
+    ObjectPolicy,
+    ObjectRecord,
+    ObjectStatus,
+    PolicyAction,
+    RiskLevel,
 )
 
 
-# 默认高风险动作列表
 HIGH_RISK_ACTIONS = {
     "delete": RiskLevel.HIGH,
     "send_email": RiskLevel.MEDIUM,
@@ -25,11 +32,7 @@ HIGH_RISK_ACTIONS = {
 
 
 class PolicyService:
-    """策略门控服务
-
-    所有 Agent 动作在执行前必须通过策略检查。
-    高风险动作自动要求用户确认。
-    """
+    """Policy gate and audit service."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -40,27 +43,8 @@ class PolicyService:
         agent_name: str,
         context: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
-        """检查动作是否被允许
-
-        Returns:
-            {
-                "allowed": bool,
-                "action": PolicyAction,
-                "reason": str,
-                "requires_confirmation": bool,
-                "risk_level": RiskLevel,
-                "policy_id": str | None,
-            }
-        """
         context = context or {}
-
-        # 1. 先查自定义策略
-        stmt = select(Policy).where(
-            Policy.is_active == True,
-            Policy.status == ObjectStatus.ACTIVE,
-        )
-        result = await self.db.execute(stmt)
-        policies = list(result.scalars().all())
+        policies = await self.get_policies()
 
         for policy in policies:
             if self._matches(policy, action, agent_name, context):
@@ -73,23 +57,21 @@ class PolicyService:
                     "policy_id": policy.id,
                 }
 
-        # 2. 回退到内置高风险动作表
         if action in HIGH_RISK_ACTIONS:
             risk = HIGH_RISK_ACTIONS[action]
             return {
                 "allowed": True,
                 "action": PolicyAction.CONFIRM,
-                "reason": f"内置安全策略: {action} 是 {risk.value} 风险级别操作",
+                "reason": f"Built-in safety policy: {action} is treated as {risk.value} risk",
                 "requires_confirmation": True,
                 "risk_level": risk,
                 "policy_id": None,
             }
 
-        # 3. 默认允许
         return {
             "allowed": True,
             "action": PolicyAction.ALLOW,
-            "reason": "默认允许",
+            "reason": "default allow",
             "requires_confirmation": False,
             "risk_level": RiskLevel.LOW,
             "policy_id": None,
@@ -97,25 +79,18 @@ class PolicyService:
 
     def _matches(
         self,
-        policy: Policy,
+        policy: ObjectPolicy,
         action: str,
         agent_name: str,
-        context: Dict,
+        context: Dict[str, Any],
     ) -> bool:
-        """判断策略是否匹配当前动作"""
         conditions = policy.conditions or {}
+        if "actions" in conditions and action not in conditions["actions"]:
+            return False
 
-        # 动作匹配
-        if "actions" in conditions:
-            if action not in conditions["actions"]:
-                return False
+        if policy.applies_to_agents and agent_name not in policy.applies_to_agents:
+            return False
 
-        # Agent 匹配
-        if policy.applies_to_agents:
-            if agent_name not in policy.applies_to_agents:
-                return False
-
-        # 上下文条件匹配
         if "context_keys" in conditions:
             for key in conditions["context_keys"]:
                 if key not in context:
@@ -129,35 +104,48 @@ class PolicyService:
         agent_name: str,
         target_type: str = None,
         target_id: str = None,
-        details: Dict = None,
+        details: Dict[str, Any] = None,
         risk_level: RiskLevel = RiskLevel.LOW,
         user_confirmed: bool = False,
         session_id: str = None,
-    ) -> AuditRecord:
-        """记录审计日志"""
-        record = AuditRecord(
-            action=action,
-            agent_name=agent_name,
-            target_type=target_type,
-            target_id=target_id,
-            details=details or {},
+    ) -> AuditLog:
+        _, tenant = await ensure_default_context(self.db)
+        agent = None
+        if agent_name:
+            agent = await get_or_create_agent(self.db, code=agent_name, display_name=agent_name)
+
+        audit = AuditLog(
+            tenant_id=tenant.id,
+            actor_agent_id=agent.id if agent else None,
+            conversation_id=session_id,
+            action_type=action,
             risk_level=risk_level,
-            user_confirmed=user_confirmed,
-            session_id=session_id,
+            requires_confirmation=not user_confirmed and risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL},
+            confirmed_at=None if not user_confirmed else audit_time(),
+            details={
+                "target_type": target_type,
+                "target_id": target_id,
+                **(details or {}),
+            },
         )
-        self.db.add(record)
+        self.db.add(audit)
         await self.db.flush()
-        return record
+        await self.db.refresh(audit, attribute_names=["actor_agent"])
+        return audit
 
     async def get_audit_log(
         self, limit: int = 50, agent_name: str = None
-    ) -> List[AuditRecord]:
-        """查询审计日志"""
-        stmt = select(AuditRecord).order_by(
-            AuditRecord.created_at.desc()
+    ) -> List[AuditLog]:
+        stmt = (
+            select(AuditLog)
+            .options(selectinload(AuditLog.actor_agent))
+            .order_by(AuditLog.created_at.desc())
         )
         if agent_name:
-            stmt = stmt.where(AuditRecord.agent_name == agent_name)
+            agent = await get_agent_by_code(self.db, agent_name)
+            if not agent:
+                return []
+            stmt = stmt.where(AuditLog.actor_agent_id == agent.id)
         stmt = stmt.limit(limit)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
@@ -169,32 +157,48 @@ class PolicyService:
         action: PolicyAction = PolicyAction.CONFIRM,
         risk_level: RiskLevel = RiskLevel.MEDIUM,
         description: str = None,
-        conditions: Dict = None,
+        conditions: Dict[str, Any] = None,
         applies_to_agents: List[str] = None,
-    ) -> Policy:
-        """创建策略规则"""
-        policy = Policy(
-            name=name,
+    ) -> ObjectPolicy:
+        user, tenant = await ensure_default_context(self.db)
+        obj = await create_object_record(
+            self.db,
+            tenant_id=tenant.id,
+            object_type="policy",
+            title=name,
+            summary=description,
+            owner_user_id=user.id,
+        )
+        policy = ObjectPolicy(
+            object_id=obj.id,
             category=category,
             action=action,
             risk_level=risk_level,
-            description=description,
             conditions=conditions or {},
             applies_to_agents=applies_to_agents or [],
         )
         self.db.add(policy)
         await self.db.flush()
+        await self.db.refresh(policy, attribute_names=["object"])
         return policy
 
-    async def get_policies(
-        self, category: str = None
-    ) -> List[Policy]:
-        """查询策略"""
-        stmt = select(Policy).where(
-            Policy.is_active == True,
-            Policy.status == ObjectStatus.ACTIVE,
+    async def get_policies(self, category: str = None) -> List[ObjectPolicy]:
+        stmt = (
+            select(ObjectPolicy)
+            .join(ObjectRecord, ObjectPolicy.object_id == ObjectRecord.id)
+            .options(selectinload(ObjectPolicy.object))
+            .where(
+                ObjectPolicy.is_active.is_(True),
+                ObjectRecord.status == ObjectStatus.ACTIVE,
+            )
         )
         if category:
-            stmt = stmt.where(Policy.category == category)
+            stmt = stmt.where(ObjectPolicy.category == category)
         result = await self.db.execute(stmt)
         return list(result.scalars().all())
+
+
+def audit_time():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)

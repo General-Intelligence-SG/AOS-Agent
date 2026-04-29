@@ -1,142 +1,151 @@
-"""AOS Chat API — 核心对话接口"""
+"""Core chat API backed by conversations + messages."""
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-import json
 
-from app.database import get_db
-from app.models import (
-    ChatSession, ChatMessage, MemoryItem, MemoryLayer,
-    Task, TaskPriority, ObjectStatus,
-)
-from app.api.schemas import ChatRequest, ChatResponse, SessionInfo
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
 from app.agents.router import router as agent_router
+from app.api.schemas import ChatRequest, ChatResponse, SessionInfo
 from app.core.memory import MemoryService
-from app.core.policy import PolicyService
 from app.core.persona import PersonaService
+from app.core.policy import PolicyService
+from app.core.storage import ensure_default_channel, ensure_default_context, get_or_create_agent
 from app.core.workflow import TaskService
+from app.database import get_db
+from app.models import Conversation, MemoryLayer, Message, ObjectStatus
+
 
 api = APIRouter(prefix="/api/chat", tags=["Chat"])
 
 
 @api.post("", response_model=ChatResponse)
 async def send_message(req: ChatRequest, db: AsyncSession = Depends(get_db)):
-    """发送消息并获取 Agent 回复"""
-    # 1. 获取或创建会话
+    user, tenant = await ensure_default_context(db)
+    channel = await ensure_default_channel(db, tenant.id)
+
     session = None
     if req.session_id:
         result = await db.execute(
-            select(ChatSession).where(ChatSession.id == req.session_id)
+            select(Conversation)
+            .options(selectinload(Conversation.current_agent))
+            .where(Conversation.id == req.session_id)
         )
         session = result.scalar_one_or_none()
 
     if not session:
-        session = ChatSession(
+        bootstrap_agent = await get_or_create_agent(
+            db,
+            code=req.agent_name or "architect",
+            display_name=req.agent_name or "architect",
+        )
+        session = Conversation(
+            tenant_id=tenant.id,
+            channel_id=channel.id,
             title=req.message[:50],
-            current_agent=req.agent_name or "architect",
+            conversation_type="chat",
+            current_agent_id=bootstrap_agent.id,
+            started_at=timestamp(),
+            last_message_at=timestamp(),
         )
         db.add(session)
         await db.flush()
+        await db.refresh(session, attribute_names=["current_agent"])
 
-    # 2. 路由到 Agent
-    target_agent_name = req.agent_name or await agent_router.route(
-        req.message, session.current_agent
-    )
-    agent = agent_router.get_agent(target_agent_name)
-    if not agent:
-        agent = agent_router.get_agent("architect")
+    current_agent_name = session.current_agent.code if session.current_agent else "architect"
+    target_agent_name = req.agent_name or await agent_router.route(req.message, current_agent_name)
+    runtime_agent = agent_router.get_agent(target_agent_name)
+    if not runtime_agent:
+        runtime_agent = agent_router.get_agent("architect")
         target_agent_name = "architect"
 
-    # 3. 设置人格
+    target_agent = await get_or_create_agent(
+        db,
+        code=target_agent_name,
+        display_name=target_agent_name,
+    )
+
     persona_svc = PersonaService(db)
     persona = await persona_svc.get_by_agent(target_agent_name)
     if persona:
-        agent.set_system_prompt(persona_svc.build_system_prompt(persona))
+        runtime_agent.set_system_prompt(persona_svc.build_system_prompt(persona))
 
-    # 4. 加载历史消息
     history_result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session.id)
-        .order_by(ChatMessage.created_at.desc())
+        select(Message)
+        .options(selectinload(Message.agent))
+        .where(Message.conversation_id == session.id)
+        .order_by(Message.created_at.desc())
         .limit(20)
     )
     history_msgs = list(reversed(list(history_result.scalars().all())))
-    session_history = [
-        {"role": m.role, "content": m.content} for m in history_msgs
-    ]
+    session_history = [{"role": msg.role, "content": msg.content} for msg in history_msgs]
 
-    # 5. 加载相关记忆
     memory_svc = MemoryService(db)
-    relevant_memories = await memory_svc.recall(
-        MemoryLayer.LONG_TERM, limit=5
-    )
+    relevant_memories = await memory_svc.recall(MemoryLayer.LONG_TERM, limit=5)
     context = {}
     if relevant_memories:
         context["related_memories"] = "\n".join(
-            f"- {m.summary or m.content[:100]}" for m in relevant_memories[:5]
+            f"- {item.summary or item.content[:100]}" for item in relevant_memories[:5]
         )
 
-    # 6. 策略检查
     policy_svc = PolicyService(db)
-    policy_check = await policy_svc.check(
-        "chat_response", target_agent_name
-    )
+    policy_check = await policy_svc.check("chat_response", target_agent_name)
 
-    # 7. 调用 Agent
-    result = await agent.process(
+    result = await runtime_agent.process(
         req.message,
         context=context,
         session_history=session_history,
     )
 
-    # 8. 保存消息
-    user_msg = ChatMessage(
-        session_id=session.id,
+    user_msg = Message(
+        conversation_id=session.id,
         role="user",
+        direction="inbound",
         content=req.message,
     )
-    assistant_msg = ChatMessage(
-        session_id=session.id,
+    assistant_msg = Message(
+        conversation_id=session.id,
         role="assistant",
+        direction="outbound",
         content=result["reply"],
-        agent_name=target_agent_name,
+        agent_id=target_agent.id,
     )
     db.add(user_msg)
     db.add(assistant_msg)
+    await db.flush()
 
-    # 9. 存储记忆
-    for mem in result.get("memories_stored", []):
+    for memory in result.get("memories_stored", []):
         await memory_svc.store(
-            MemoryLayer(mem.get("layer", "long_term")),
-            mem.get("content", ""),
+            MemoryLayer(memory.get("layer", "long_term")),
+            memory.get("content", ""),
             source_agent=target_agent_name,
             source_session=session.id,
         )
 
-    # 10. 创建任务
     task_svc = TaskService(db)
     tasks_created = []
-    for t in result.get("tasks_created", []):
+    for task_payload in result.get("tasks_created", []):
         task = await task_svc.create(
-            title=t["title"],
-            assigned_agent=t.get("source", target_agent_name),
+            title=task_payload["title"],
+            assigned_agent=task_payload.get("source", target_agent_name),
             source_session=session.id,
         )
         tasks_created.append({"id": task.id, "title": task.title})
 
-    # 11. 审计
     await policy_svc.record_audit(
         "chat_response",
         target_agent_name,
-        "chat_session",
+        "conversation",
         session.id,
         session_id=session.id,
+        details={"reply_preview": result["reply"][:200], "user_id": user.id},
     )
 
-    # 12. 更新会话
-    session.current_agent = target_agent_name
+    session.current_agent_id = target_agent.id
+    session.title = session.title or req.message[:50]
+    session.message_count = (session.message_count or 0) + 2
+    session.last_message_at = timestamp()
     await db.flush()
 
     return ChatResponse(
@@ -150,62 +159,62 @@ async def send_message(req: ChatRequest, db: AsyncSession = Depends(get_db)):
 
 
 @api.get("/sessions", response_model=List[SessionInfo])
-async def list_sessions(
-    limit: int = 20, db: AsyncSession = Depends(get_db)
-):
-    """列出会话"""
+async def list_sessions(limit: int = 20, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(ChatSession)
-        .where(ChatSession.is_active == True)
-        .order_by(ChatSession.updated_at.desc())
+        select(Conversation)
+        .options(selectinload(Conversation.current_agent))
+        .where(Conversation.status == ObjectStatus.ACTIVE)
+        .order_by(Conversation.updated_at.desc())
         .limit(limit)
     )
     sessions = result.scalars().all()
     return [
         SessionInfo(
-            id=s.id,
-            title=s.title,
-            current_agent=s.current_agent,
-            created_at=s.created_at,
-            updated_at=s.updated_at,
+            id=session.id,
+            title=session.title,
+            current_agent=session.current_agent.code if session.current_agent else "architect",
+            created_at=session.created_at,
+            updated_at=session.updated_at,
         )
-        for s in sessions
+        for session in sessions
     ]
 
 
 @api.get("/sessions/{session_id}/messages")
-async def get_session_messages(
-    session_id: str, db: AsyncSession = Depends(get_db)
-):
-    """获取会话消息"""
+async def get_session_messages(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at.asc())
+        select(Message)
+        .options(selectinload(Message.agent))
+        .where(Message.conversation_id == session_id)
+        .order_by(Message.created_at.asc())
     )
     messages = result.scalars().all()
     return [
         {
-            "id": m.id,
-            "role": m.role,
-            "content": m.content,
-            "agent_name": m.agent_name,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "id": msg.id,
+            "role": msg.role,
+            "content": msg.content,
+            "agent_name": msg.agent_name,
+            "created_at": msg.created_at.isoformat() if msg.created_at else None,
         }
-        for m in messages
+        for msg in messages
     ]
 
 
 @api.delete("/sessions/{session_id}")
-async def delete_session(
-    session_id: str, db: AsyncSession = Depends(get_db)
-):
-    """删除会话"""
+async def delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id)
+        select(Conversation).where(Conversation.id == session_id)
     )
     session = result.scalar_one_or_none()
-    if session:
-        session.is_active = False
-        await db.flush()
+    if not session:
+        raise HTTPException(404, "Session not found")
+    session.status = ObjectStatus.DELETED
+    await db.flush()
     return {"status": "ok"}
+
+
+def timestamp():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
