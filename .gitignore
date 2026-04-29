@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 .venv/
 backend/.env
+backend/.venv/
+backend/**/__pycache__/
+backend/data/
