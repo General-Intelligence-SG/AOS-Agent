@@ -1,6 +1,6 @@
 """AOS resource APIs backed by the generalized schema."""
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import json
 import os
 
@@ -19,6 +19,19 @@ from app.api.schemas import (
     ExportResponse,
     MemoryCreate,
     MemoryResponse,
+    ObjectContactPayload,
+    ObjectCreate,
+    ObjectDocumentPayload,
+    ObjectEvidenceCreate,
+    ObjectEvidenceResponse,
+    ObjectLinkCreate,
+    ObjectLinkResponse,
+    ObjectMeetingPayload,
+    ObjectMemoryPayload,
+    ObjectProjectPayload,
+    ObjectResponse,
+    ObjectUpdate,
+    ObjectWorkItemPayload,
     TaskCreate,
     TaskResponse,
     TaskUpdate,
@@ -30,11 +43,17 @@ from app.core.storage import create_object_record, ensure_default_context, get_o
 from app.core.workflow import TaskService
 from app.database import get_db
 from app.models import (
+    Agent,
     Conversation,
     FileRecord,
     MemoryLayer,
+    ObjectContact,
+    ObjectEvidence,
     ObjectDocument,
+    ObjectLink,
     ObjectMemory,
+    ObjectMeeting,
+    ObjectProject,
     ObjectRecord,
     ObjectStatus,
     ObjectWorkItem,
@@ -88,6 +107,297 @@ def serialize_memory(item: ObjectMemory) -> MemoryResponse:
         version=item.version,
         created_at=created_at,
     )
+
+
+async def _resolve_agent(db: AsyncSession, agent_name: Optional[str]) -> Optional[Agent]:
+    if not agent_name:
+        return None
+    return await get_or_create_agent(db, code=agent_name, display_name=agent_name)
+
+
+def _normalize_object_type(object_type: str) -> str:
+    value = (object_type or "").strip().lower()
+    if value in {"task", "goal", "issue", "review", "reminder", "approval", "test_case"}:
+        return "work_item"
+    if value in {"doc", "knowledge"}:
+        return "document"
+    return value or "object"
+
+
+def _required_detail_field(object_type: str) -> Optional[str]:
+    mapping = {
+        "document": "document",
+        "work_item": "work_item",
+        "meeting": "meeting",
+        "memory": "memory",
+        "contact": "contact",
+        "project": "project",
+    }
+    return mapping.get(object_type)
+
+
+async def _get_object_or_404(db: AsyncSession, object_id: str) -> ObjectRecord:
+    result = await db.execute(
+        select(ObjectRecord)
+        .options(selectinload(ObjectRecord.primary_agent))
+        .where(ObjectRecord.id == object_id)
+    )
+    obj = result.scalar_one_or_none()
+    if not obj or obj.status == ObjectStatus.DELETED:
+        raise HTTPException(404, "Object not found")
+    return obj
+
+
+async def _get_object_detail(db: AsyncSession, obj: ObjectRecord) -> Dict[str, Any]:
+    detail: Dict[str, Any] = {}
+
+    if obj.object_type == "document":
+        result = await db.execute(select(ObjectDocument).where(ObjectDocument.object_id == obj.id))
+        row = result.scalar_one_or_none()
+        if row:
+            detail = {
+                "content": row.content,
+                "file_path": row.file_path,
+                "file_type": row.file_type,
+                "file_size": row.file_size,
+                "category": row.category,
+                "project": row.project,
+                "tags": row.tags or [],
+                "metadata": row.metadata_extra or {},
+                "is_knowledge": row.is_knowledge,
+                "format": row.format,
+            }
+        return detail
+
+    if obj.object_type == "work_item":
+        result = await db.execute(
+            select(ObjectWorkItem)
+            .options(selectinload(ObjectWorkItem.assigned_agent))
+            .where(ObjectWorkItem.object_id == obj.id)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            detail = {
+                "work_item_kind": row.work_item_kind,
+                "description": row.description,
+                "priority": row.priority.value if row.priority else None,
+                "task_status": row.task_status.value if row.task_status else None,
+                "assigned_agent": row.assigned_agent_code,
+                "project": row.project,
+                "due_date": row.due_date,
+                "reminder_at": row.reminder_at,
+                "tags": row.tags or [],
+                "checklist": row.checklist or [],
+                "relations": row.relations or {},
+                "source_session": row.source_conversation_id,
+            }
+        return detail
+
+    if obj.object_type == "meeting":
+        result = await db.execute(select(ObjectMeeting).where(ObjectMeeting.object_id == obj.id))
+        row = result.scalar_one_or_none()
+        if row:
+            detail = {
+                "starts_at": row.starts_at,
+                "ends_at": row.ends_at,
+                "organizer_name": row.organizer_name,
+                "transcript_file_id": row.transcript_file_id,
+                "action_item_count": row.action_item_count,
+                "metadata": row.metadata_json or {},
+            }
+        return detail
+
+    if obj.object_type == "memory":
+        result = await db.execute(
+            select(ObjectMemory)
+            .options(selectinload(ObjectMemory.source_agent))
+            .where(ObjectMemory.object_id == obj.id)
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            detail = {
+                "layer": row.layer.value if row.layer else None,
+                "content": row.content,
+                "tags": row.tags or [],
+                "source_agent": row.source_agent_name,
+                "source_session": row.source_conversation_id,
+                "importance": row.importance,
+                "relations": row.relations or {},
+                "memory_scope": row.memory_scope,
+                "is_private": row.is_private,
+            }
+        return detail
+
+    if obj.object_type == "contact":
+        result = await db.execute(select(ObjectContact).where(ObjectContact.object_id == obj.id))
+        row = result.scalar_one_or_none()
+        if row:
+            detail = {
+                "organization": row.organization,
+                "job_title": row.job_title,
+                "email": row.email,
+                "mobile": row.mobile,
+                "contact_type": row.contact_type,
+                "relation_type": row.relation_type,
+                "metadata": row.metadata_json or {},
+            }
+        return detail
+
+    if obj.object_type == "project":
+        result = await db.execute(select(ObjectProject).where(ObjectProject.object_id == obj.id))
+        row = result.scalar_one_or_none()
+        if row:
+            detail = {
+                "phase": row.phase,
+                "health": row.health,
+                "progress": row.progress,
+                "owner_name": row.owner_name,
+                "metadata": row.metadata_json or {},
+            }
+        return detail
+
+    return detail
+
+
+async def _serialize_object(db: AsyncSession, obj: ObjectRecord) -> ObjectResponse:
+    return ObjectResponse(
+        id=obj.id,
+        object_type=obj.object_type,
+        title=obj.title,
+        summary=obj.summary,
+        lifecycle_stage=obj.lifecycle_stage,
+        visibility=obj.visibility,
+        importance=obj.importance,
+        confidence=obj.confidence,
+        current_version=obj.current_version,
+        occurred_at=obj.occurred_at,
+        due_at=obj.due_at,
+        status=obj.status.value,
+        metadata=obj.metadata_json or {},
+        primary_agent_name=obj.primary_agent.code if obj.primary_agent else None,
+        created_at=obj.created_at,
+        updated_at=obj.updated_at,
+        detail=await _get_object_detail(db, obj),
+    )
+
+
+async def _upsert_document_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectDocumentPayload) -> None:
+    result = await db.execute(select(ObjectDocument).where(ObjectDocument.object_id == obj.id))
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ObjectDocument(object_id=obj.id)
+        db.add(row)
+    row.content = payload.content
+    row.file_path = payload.file_path
+    row.file_type = payload.file_type
+    row.file_size = payload.file_size
+    row.category = payload.category
+    row.project = payload.project
+    row.tags = payload.tags
+    row.metadata_extra = payload.metadata
+    row.is_knowledge = payload.is_knowledge
+    row.format = payload.format
+
+
+async def _upsert_work_item_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectWorkItemPayload) -> None:
+    result = await db.execute(
+        select(ObjectWorkItem)
+        .options(selectinload(ObjectWorkItem.assigned_agent))
+        .where(ObjectWorkItem.object_id == obj.id)
+    )
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ObjectWorkItem(object_id=obj.id)
+        db.add(row)
+    agent = await _resolve_agent(db, payload.assigned_agent)
+    row.work_item_kind = payload.work_item_kind
+    row.description = payload.description
+    row.priority = TaskPriority(payload.priority)
+    row.task_status = TaskStatus(payload.task_status)
+    row.assigned_agent_id = agent.id if agent else None
+    row.project = payload.project
+    row.due_date = payload.due_date
+    row.reminder_at = payload.reminder_at
+    row.tags = payload.tags
+    row.checklist = payload.checklist
+    row.relations = payload.relations
+    row.source_conversation_id = payload.source_session
+    obj.due_at = payload.due_date
+
+
+async def _upsert_meeting_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectMeetingPayload) -> None:
+    result = await db.execute(select(ObjectMeeting).where(ObjectMeeting.object_id == obj.id))
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ObjectMeeting(object_id=obj.id)
+        db.add(row)
+    row.starts_at = payload.starts_at
+    row.ends_at = payload.ends_at
+    row.organizer_name = payload.organizer_name
+    row.transcript_file_id = payload.transcript_file_id
+    row.action_item_count = payload.action_item_count
+    row.metadata_json = payload.metadata
+
+
+async def _upsert_memory_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectMemoryPayload) -> None:
+    result = await db.execute(select(ObjectMemory).where(ObjectMemory.object_id == obj.id))
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ObjectMemory(object_id=obj.id)
+        db.add(row)
+    agent = await _resolve_agent(db, payload.source_agent)
+    row.layer = MemoryLayer(payload.layer)
+    row.content = payload.content
+    row.tags = payload.tags
+    row.source_agent_id = agent.id if agent else None
+    row.source_conversation_id = payload.source_session
+    row.relations = payload.relations
+    row.memory_scope = payload.memory_scope
+    row.is_private = payload.is_private
+    obj.importance = payload.importance
+
+
+async def _upsert_contact_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectContactPayload) -> None:
+    result = await db.execute(select(ObjectContact).where(ObjectContact.object_id == obj.id))
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ObjectContact(object_id=obj.id)
+        db.add(row)
+    row.organization = payload.organization
+    row.job_title = payload.job_title
+    row.email = payload.email
+    row.mobile = payload.mobile
+    row.contact_type = payload.contact_type
+    row.relation_type = payload.relation_type
+    row.metadata_json = payload.metadata
+
+
+async def _upsert_project_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectProjectPayload) -> None:
+    result = await db.execute(select(ObjectProject).where(ObjectProject.object_id == obj.id))
+    row = result.scalar_one_or_none()
+    if not row:
+        row = ObjectProject(object_id=obj.id)
+        db.add(row)
+    row.phase = payload.phase
+    row.health = payload.health
+    row.progress = payload.progress
+    row.owner_name = payload.owner_name
+    row.metadata_json = payload.metadata
+
+
+async def _apply_object_detail(db: AsyncSession, obj: ObjectRecord, payload: ObjectCreate | ObjectUpdate) -> None:
+    if payload.document is not None:
+        await _upsert_document_detail(db, obj, payload.document)
+    if payload.work_item is not None:
+        await _upsert_work_item_detail(db, obj, payload.work_item)
+    if payload.meeting is not None:
+        await _upsert_meeting_detail(db, obj, payload.meeting)
+    if payload.memory is not None:
+        await _upsert_memory_detail(db, obj, payload.memory)
+    if payload.contact is not None:
+        await _upsert_contact_detail(db, obj, payload.contact)
+    if payload.project is not None:
+        await _upsert_project_detail(db, obj, payload.project)
 
 
 knowledge_api = APIRouter(prefix="/api/knowledge", tags=["Knowledge"])
@@ -372,6 +682,7 @@ async def switch_agent(req: AgentSwitchRequest, db: AsyncSession = Depends(get_d
 
 
 memory_api = APIRouter(prefix="/api/memory", tags=["Memory"])
+objects_api = APIRouter(prefix="/api/objects", tags=["Objects"])
 
 
 @memory_api.get("", response_model=List[MemoryResponse])
@@ -396,6 +707,251 @@ async def create_memory(mem: MemoryCreate, db: AsyncSession = Depends(get_db)):
         importance=mem.importance,
     )
     return serialize_memory(item)
+
+
+@objects_api.post("", response_model=ObjectResponse)
+async def create_object(payload: ObjectCreate, db: AsyncSession = Depends(get_db)):
+    user, tenant = await ensure_default_context(db)
+    agent = await _resolve_agent(db, payload.primary_agent_name)
+    object_type = _normalize_object_type(payload.object_type)
+    detail_field = _required_detail_field(object_type)
+    if detail_field and getattr(payload, detail_field) is None:
+        raise HTTPException(
+            400,
+            f"object_type '{object_type}' requires a '{detail_field}' payload",
+        )
+    obj = await create_object_record(
+        db,
+        tenant_id=tenant.id,
+        object_type=object_type,
+        title=payload.title,
+        summary=payload.summary,
+        owner_user_id=user.id,
+        primary_agent_id=agent.id if agent else None,
+        importance=payload.importance,
+        confidence=payload.confidence,
+        occurred_at=payload.occurred_at,
+        due_at=payload.due_at,
+        metadata=payload.metadata,
+    )
+    obj.lifecycle_stage = payload.lifecycle_stage or obj.lifecycle_stage
+    obj.visibility = payload.visibility
+    await _apply_object_detail(db, obj, payload)
+    await db.flush()
+    await db.refresh(obj, attribute_names=["primary_agent"])
+    return await _serialize_object(db, obj)
+
+
+@objects_api.get("", response_model=List[ObjectResponse])
+async def list_objects(
+    object_type: Optional[str] = None,
+    lifecycle_stage: Optional[str] = None,
+    keyword: Optional[str] = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = (
+        select(ObjectRecord)
+        .options(selectinload(ObjectRecord.primary_agent))
+        .where(ObjectRecord.status == ObjectStatus.ACTIVE)
+    )
+    if object_type:
+        stmt = stmt.where(ObjectRecord.object_type == _normalize_object_type(object_type))
+    if lifecycle_stage:
+        stmt = stmt.where(ObjectRecord.lifecycle_stage == lifecycle_stage)
+    if keyword:
+        stmt = stmt.where(
+            (ObjectRecord.title.contains(keyword)) | (ObjectRecord.summary.contains(keyword))
+        )
+    stmt = stmt.order_by(ObjectRecord.created_at.desc()).limit(limit)
+    result = await db.execute(stmt)
+    objects = result.scalars().all()
+    return [await _serialize_object(db, obj) for obj in objects]
+
+
+@objects_api.get("/{object_id}", response_model=ObjectResponse)
+async def get_object(object_id: str, db: AsyncSession = Depends(get_db)):
+    obj = await _get_object_or_404(db, object_id)
+    return await _serialize_object(db, obj)
+
+
+@objects_api.put("/{object_id}", response_model=ObjectResponse)
+async def update_object(object_id: str, payload: ObjectUpdate, db: AsyncSession = Depends(get_db)):
+    obj = await _get_object_or_404(db, object_id)
+    agent = await _resolve_agent(db, payload.primary_agent_name)
+
+    if payload.title is not None:
+        obj.title = payload.title
+    if payload.summary is not None:
+        obj.summary = payload.summary
+    if payload.lifecycle_stage is not None:
+        obj.lifecycle_stage = payload.lifecycle_stage
+    if payload.visibility is not None:
+        obj.visibility = payload.visibility
+    if payload.importance is not None:
+        obj.importance = payload.importance
+    if payload.confidence is not None:
+        obj.confidence = payload.confidence
+    if payload.occurred_at is not None:
+        obj.occurred_at = payload.occurred_at
+    if payload.due_at is not None:
+        obj.due_at = payload.due_at
+    if payload.metadata is not None:
+        obj.metadata_json = payload.metadata
+    if agent is not None:
+        obj.primary_agent_id = agent.id
+
+    obj.current_version = (obj.current_version or 1) + 1
+    await _apply_object_detail(db, obj, payload)
+    await db.flush()
+    await db.refresh(obj, attribute_names=["primary_agent"])
+    return await _serialize_object(db, obj)
+
+
+@objects_api.delete("/{object_id}")
+async def delete_object(object_id: str, db: AsyncSession = Depends(get_db)):
+    obj = await _get_object_or_404(db, object_id)
+    obj.status = ObjectStatus.DELETED
+    await db.flush()
+    return {"status": "ok"}
+
+
+@objects_api.post("/{object_id}/links", response_model=ObjectLinkResponse)
+async def create_object_link(
+    object_id: str,
+    payload: ObjectLinkCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    user, tenant = await ensure_default_context(db)
+    _ = user
+    await _get_object_or_404(db, object_id)
+    await _get_object_or_404(db, payload.to_object_id)
+    row = ObjectLink(
+        tenant_id=tenant.id,
+        from_object_id=object_id,
+        to_object_id=payload.to_object_id,
+        link_type=payload.link_type,
+        link_role=payload.link_role,
+        sort_order=payload.sort_order,
+        weight=payload.weight,
+        provenance=payload.provenance,
+        metadata_json=payload.metadata,
+    )
+    db.add(row)
+    await db.flush()
+    return ObjectLinkResponse(
+        id=row.id,
+        from_object_id=row.from_object_id,
+        to_object_id=row.to_object_id,
+        link_type=row.link_type,
+        link_role=row.link_role,
+        sort_order=row.sort_order,
+        weight=row.weight,
+        provenance=row.provenance,
+        metadata=row.metadata_json or {},
+        created_at=row.created_at,
+    )
+
+
+@objects_api.get("/{object_id}/links", response_model=List[ObjectLinkResponse])
+async def list_object_links(
+    object_id: str,
+    link_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_object_or_404(db, object_id)
+    stmt = select(ObjectLink).where(
+        (ObjectLink.from_object_id == object_id) | (ObjectLink.to_object_id == object_id)
+    )
+    if link_type:
+        stmt = stmt.where(ObjectLink.link_type == link_type)
+    stmt = stmt.order_by(ObjectLink.created_at.desc())
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    return [
+        ObjectLinkResponse(
+            id=row.id,
+            from_object_id=row.from_object_id,
+            to_object_id=row.to_object_id,
+            link_type=row.link_type,
+            link_role=row.link_role,
+            sort_order=row.sort_order,
+            weight=row.weight,
+            provenance=row.provenance,
+            metadata=row.metadata_json or {},
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@objects_api.post("/{object_id}/evidences", response_model=ObjectEvidenceResponse)
+async def create_object_evidence(
+    object_id: str,
+    payload: ObjectEvidenceCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_object_or_404(db, object_id)
+    row = ObjectEvidence(
+        object_id=object_id,
+        evidence_type=payload.evidence_type,
+        source_system_id=payload.source_system_id,
+        conversation_id=payload.conversation_id,
+        message_id=payload.message_id,
+        file_id=payload.file_id,
+        snippet_text=payload.snippet_text,
+        locator=payload.locator,
+        checksum=payload.checksum,
+        confidence=payload.confidence,
+    )
+    db.add(row)
+    await db.flush()
+    return ObjectEvidenceResponse(
+        id=row.id,
+        object_id=row.object_id,
+        evidence_type=row.evidence_type,
+        source_system_id=row.source_system_id,
+        conversation_id=row.conversation_id,
+        message_id=row.message_id,
+        file_id=row.file_id,
+        snippet_text=row.snippet_text,
+        locator=row.locator or {},
+        checksum=row.checksum,
+        confidence=row.confidence,
+        created_at=row.created_at,
+    )
+
+
+@objects_api.get("/{object_id}/evidences", response_model=List[ObjectEvidenceResponse])
+async def list_object_evidences(
+    object_id: str,
+    evidence_type: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_object_or_404(db, object_id)
+    stmt = select(ObjectEvidence).where(ObjectEvidence.object_id == object_id)
+    if evidence_type:
+        stmt = stmt.where(ObjectEvidence.evidence_type == evidence_type)
+    stmt = stmt.order_by(ObjectEvidence.created_at.desc())
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    return [
+        ObjectEvidenceResponse(
+            id=row.id,
+            object_id=row.object_id,
+            evidence_type=row.evidence_type,
+            source_system_id=row.source_system_id,
+            conversation_id=row.conversation_id,
+            message_id=row.message_id,
+            file_id=row.file_id,
+            snippet_text=row.snippet_text,
+            locator=row.locator or {},
+            checksum=row.checksum,
+            confidence=row.confidence,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
 
 
 export_api = APIRouter(prefix="/api/data", tags=["Export/Import"])
@@ -448,6 +1004,18 @@ async def export_data(req: ExportRequest, db: AsyncSession = Depends(get_db)):
                 "tags": task.tags,
             }
             for task in tasks
+        ]
+
+    if req.include_objects:
+        result = await db.execute(
+            select(ObjectRecord)
+            .options(selectinload(ObjectRecord.primary_agent))
+            .where(ObjectRecord.status == ObjectStatus.ACTIVE)
+            .order_by(ObjectRecord.created_at.desc())
+        )
+        data["objects"] = [
+            (await _serialize_object(db, obj)).model_dump(mode="json")
+            for obj in result.scalars().all()
         ]
 
     filename = f"aos_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"

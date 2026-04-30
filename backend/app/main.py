@@ -14,7 +14,14 @@ from app.agents.seeker import SeekerAgent
 from app.agents.sorter import SorterAgent
 from app.agents.transcriber import TranscriberAgent
 from app.api.chat import api as chat_api
-from app.api.endpoints import agents_api, export_api, knowledge_api, memory_api, tasks_api
+from app.api.endpoints import (
+    agents_api,
+    export_api,
+    knowledge_api,
+    memory_api,
+    objects_api,
+    tasks_api,
+)
 from app.config import settings
 from app.core.persona import PersonaService
 from app.core.policy import PolicyService
@@ -139,6 +146,7 @@ app.include_router(knowledge_api)
 app.include_router(tasks_api)
 app.include_router(agents_api)
 app.include_router(memory_api)
+app.include_router(objects_api)
 app.include_router(export_api)
 
 
@@ -246,6 +254,15 @@ async def list_mcp_tools():
                 },
             },
             {
+                "name": "aos_get_knowledge",
+                "description": "Get a single knowledge document by id",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"doc_id": {"type": "string"}},
+                    "required": ["doc_id"],
+                },
+            },
+            {
                 "name": "aos_create_task",
                 "description": "Create a task",
                 "inputSchema": {
@@ -266,7 +283,10 @@ async def list_mcp_tools():
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "status": {"type": "string", "enum": ["todo", "in_progress", "waiting", "done"]},
+                        "status": {
+                            "type": "string",
+                            "enum": ["todo", "in_progress", "waiting", "done", "cancelled"],
+                        },
                         "project": {"type": "string"},
                         "limit": {"type": "integer", "default": 30},
                     },
@@ -282,8 +302,147 @@ async def list_mcp_tools():
                         "title": {"type": "string"},
                         "task_status": {"type": "string"},
                         "priority": {"type": "string"},
+                        "description": {"type": "string"},
                     },
                     "required": ["task_id"],
+                },
+            },
+            {
+                "name": "aos_create_object",
+                "description": "Create an object in the generalized object store",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_type": {"type": "string"},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "lifecycle_stage": {"type": "string"},
+                        "visibility": {"type": "string"},
+                        "importance": {"type": "number", "default": 0.5},
+                        "confidence": {"type": "number", "default": 1.0},
+                        "occurred_at": {"type": "string", "format": "date-time"},
+                        "due_at": {"type": "string", "format": "date-time"},
+                        "primary_agent_name": {"type": "string"},
+                        "metadata": {"type": "object", "additionalProperties": True},
+                        "document": {"type": "object", "additionalProperties": True},
+                        "work_item": {"type": "object", "additionalProperties": True},
+                        "meeting": {"type": "object", "additionalProperties": True},
+                        "memory": {"type": "object", "additionalProperties": True},
+                        "contact": {"type": "object", "additionalProperties": True},
+                        "project": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["object_type", "title"],
+                },
+            },
+            {
+                "name": "aos_list_objects",
+                "description": "List objects with optional filters",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_type": {"type": "string"},
+                        "lifecycle_stage": {"type": "string"},
+                        "keyword": {"type": "string"},
+                        "limit": {"type": "integer", "default": 50},
+                    },
+                },
+            },
+            {
+                "name": "aos_get_object",
+                "description": "Get a single object by id",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"object_id": {"type": "string"}},
+                    "required": ["object_id"],
+                },
+            },
+            {
+                "name": "aos_update_object",
+                "description": "Update an object and optional specialized detail payloads",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "lifecycle_stage": {"type": "string"},
+                        "visibility": {"type": "string"},
+                        "importance": {"type": "number"},
+                        "confidence": {"type": "number"},
+                        "occurred_at": {"type": "string", "format": "date-time"},
+                        "due_at": {"type": "string", "format": "date-time"},
+                        "primary_agent_name": {"type": "string"},
+                        "metadata": {"type": "object", "additionalProperties": True},
+                        "document": {"type": "object", "additionalProperties": True},
+                        "work_item": {"type": "object", "additionalProperties": True},
+                        "meeting": {"type": "object", "additionalProperties": True},
+                        "memory": {"type": "object", "additionalProperties": True},
+                        "contact": {"type": "object", "additionalProperties": True},
+                        "project": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["object_id"],
+                },
+            },
+            {
+                "name": "aos_link_objects",
+                "description": "Create a relationship between two objects",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_id": {"type": "string"},
+                        "to_object_id": {"type": "string"},
+                        "link_type": {"type": "string"},
+                        "link_role": {"type": "string"},
+                        "sort_order": {"type": "integer"},
+                        "weight": {"type": "number"},
+                        "provenance": {"type": "string"},
+                        "metadata": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["object_id", "to_object_id", "link_type"],
+                },
+            },
+            {
+                "name": "aos_list_object_links",
+                "description": "List links for an object",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_id": {"type": "string"},
+                        "link_type": {"type": "string"},
+                    },
+                    "required": ["object_id"],
+                },
+            },
+            {
+                "name": "aos_add_object_evidence",
+                "description": "Attach evidence to an object",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_id": {"type": "string"},
+                        "evidence_type": {"type": "string"},
+                        "source_system_id": {"type": "string"},
+                        "conversation_id": {"type": "string"},
+                        "message_id": {"type": "string"},
+                        "file_id": {"type": "string"},
+                        "snippet_text": {"type": "string"},
+                        "locator": {"type": "object", "additionalProperties": True},
+                        "checksum": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["object_id", "evidence_type"],
+                },
+            },
+            {
+                "name": "aos_list_object_evidences",
+                "description": "List evidences for an object",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "object_id": {"type": "string"},
+                        "evidence_type": {"type": "string"},
+                    },
+                    "required": ["object_id"],
                 },
             },
             {
@@ -327,6 +486,30 @@ async def list_mcp_tools():
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {
+                "name": "aos_health_check",
+                "description": "Check backend service health",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "aos_list_sessions",
+                "description": "List recent chat sessions",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "default": 10},
+                    },
+                },
+            },
+            {
+                "name": "aos_get_session_messages",
+                "description": "Get all messages for one chat session",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"session_id": {"type": "string"}},
+                    "required": ["session_id"],
+                },
+            },
+            {
                 "name": "aos_export_data",
                 "description": "Export AOS data",
                 "inputSchema": {
@@ -335,6 +518,8 @@ async def list_mcp_tools():
                         "include_memories": {"type": "boolean", "default": True},
                         "include_documents": {"type": "boolean", "default": True},
                         "include_tasks": {"type": "boolean", "default": True},
+                        "include_personas": {"type": "boolean", "default": True},
+                        "include_objects": {"type": "boolean", "default": True},
                     },
                 },
             },

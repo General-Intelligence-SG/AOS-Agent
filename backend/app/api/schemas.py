@@ -122,11 +122,188 @@ class MemoryResponse(BaseModel):
 
 
 # ──────────────────── Export / Import ────────────────────
+class ObjectWorkItemPayload(BaseModel):
+    work_item_kind: str = "task"
+    description: Optional[str] = None
+    priority: str = "medium"
+    task_status: str = "todo"
+    assigned_agent: Optional[str] = None
+    project: Optional[str] = None
+    due_date: Optional[datetime] = None
+    reminder_at: Optional[datetime] = None
+    tags: List[str] = Field(default_factory=list)
+    checklist: List[Dict[str, Any]] = Field(default_factory=list)
+    relations: Dict[str, Any] = Field(default_factory=dict)
+    source_session: Optional[str] = None
+
+
+class ObjectDocumentPayload(BaseModel):
+    content: Optional[str] = None
+    file_path: Optional[str] = None
+    file_type: Optional[str] = None
+    file_size: int = 0
+    category: Optional[str] = None
+    project: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    is_knowledge: bool = False
+    format: Optional[str] = None
+
+
+class ObjectMeetingPayload(BaseModel):
+    starts_at: Optional[datetime] = None
+    ends_at: Optional[datetime] = None
+    organizer_name: Optional[str] = None
+    transcript_file_id: Optional[str] = None
+    action_item_count: int = 0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ObjectMemoryPayload(BaseModel):
+    layer: str = "long_term"
+    content: str
+    tags: List[str] = Field(default_factory=list)
+    source_agent: Optional[str] = None
+    source_session: Optional[str] = None
+    importance: float = 0.5
+    relations: Dict[str, Any] = Field(default_factory=dict)
+    memory_scope: str = "tenant"
+    is_private: bool = False
+
+
+class ObjectContactPayload(BaseModel):
+    organization: Optional[str] = None
+    job_title: Optional[str] = None
+    email: Optional[str] = None
+    mobile: Optional[str] = None
+    contact_type: Optional[str] = None
+    relation_type: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ObjectProjectPayload(BaseModel):
+    phase: Optional[str] = None
+    health: Optional[str] = None
+    progress: float = 0.0
+    owner_name: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ObjectCreate(BaseModel):
+    object_type: str
+    title: str
+    summary: Optional[str] = None
+    lifecycle_stage: Optional[str] = None
+    visibility: str = "tenant"
+    importance: float = 0.5
+    confidence: float = 1.0
+    occurred_at: Optional[datetime] = None
+    due_at: Optional[datetime] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    primary_agent_name: Optional[str] = None
+    document: Optional[ObjectDocumentPayload] = None
+    work_item: Optional[ObjectWorkItemPayload] = None
+    meeting: Optional[ObjectMeetingPayload] = None
+    memory: Optional[ObjectMemoryPayload] = None
+    contact: Optional[ObjectContactPayload] = None
+    project: Optional[ObjectProjectPayload] = None
+
+
+class ObjectUpdate(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    lifecycle_stage: Optional[str] = None
+    visibility: Optional[str] = None
+    importance: Optional[float] = None
+    confidence: Optional[float] = None
+    occurred_at: Optional[datetime] = None
+    due_at: Optional[datetime] = None
+    metadata: Optional[Dict[str, Any]] = None
+    primary_agent_name: Optional[str] = None
+    document: Optional[ObjectDocumentPayload] = None
+    work_item: Optional[ObjectWorkItemPayload] = None
+    meeting: Optional[ObjectMeetingPayload] = None
+    memory: Optional[ObjectMemoryPayload] = None
+    contact: Optional[ObjectContactPayload] = None
+    project: Optional[ObjectProjectPayload] = None
+
+
+class ObjectResponse(BaseModel):
+    id: str
+    object_type: str
+    title: str
+    summary: Optional[str]
+    lifecycle_stage: Optional[str]
+    visibility: Optional[str]
+    importance: float
+    confidence: float
+    current_version: int
+    occurred_at: Optional[datetime]
+    due_at: Optional[datetime]
+    status: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    primary_agent_name: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    detail: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ObjectLinkCreate(BaseModel):
+    to_object_id: str
+    link_type: str
+    link_role: Optional[str] = None
+    sort_order: Optional[int] = None
+    weight: Optional[float] = None
+    provenance: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ObjectLinkResponse(BaseModel):
+    id: str
+    from_object_id: str
+    to_object_id: str
+    link_type: str
+    link_role: Optional[str]
+    sort_order: Optional[int]
+    weight: Optional[float]
+    provenance: Optional[str]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class ObjectEvidenceCreate(BaseModel):
+    evidence_type: str
+    source_system_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    message_id: Optional[str] = None
+    file_id: Optional[str] = None
+    snippet_text: Optional[str] = None
+    locator: Dict[str, Any] = Field(default_factory=dict)
+    checksum: Optional[str] = None
+    confidence: Optional[float] = None
+
+
+class ObjectEvidenceResponse(BaseModel):
+    id: str
+    object_id: str
+    evidence_type: str
+    source_system_id: Optional[str]
+    conversation_id: Optional[str]
+    message_id: Optional[str]
+    file_id: Optional[str]
+    snippet_text: Optional[str]
+    locator: Dict[str, Any] = Field(default_factory=dict)
+    checksum: Optional[str]
+    confidence: Optional[float]
+    created_at: datetime
+
+
 class ExportRequest(BaseModel):
     include_memories: bool = True
     include_personas: bool = True
     include_documents: bool = True
     include_tasks: bool = True
+    include_objects: bool = True
     password: Optional[str] = None
 
 class ImportRequest(BaseModel):
