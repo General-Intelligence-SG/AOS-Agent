@@ -8,3 +8,6 @@ backend/.env
 backend/.venv/
 backend/**/__pycache__/
 backend/data/
+.backend.pid
+.frontend.pid
+frontend/node_modules/
