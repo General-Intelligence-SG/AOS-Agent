@@ -12,9 +12,8 @@
 import json
 import asyncio
 import subprocess
-import sys
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 from pathlib import Path
 
 logger = logging.getLogger("aos.openclaw")
@@ -23,28 +22,69 @@ logger = logging.getLogger("aos.openclaw")
 class OpenClawBridge:
     """OpenClaw 桥接层
 
-    通过 OpenClaw CLI 或 WebSocket 控制平面与 Gateway 通信，
+    通过 OpenClaw CLI 或本地工作区与 Gateway 通信，
     让 AOS Agent 能使用 OpenClaw 已安装的工具。
 
-    通信方式优先级:
-    1. WebSocket 控制平面 (ws://localhost:18789) — 生产模式
-    2. CLI 命令 (`openclaw tool call`) — PoC 模式
-    3. 直接 HTTP (localhost:8080) — 如果 OpenClaw Gateway 暴露了 REST
+    当前兼容策略:
+    1. 新版 OpenClaw CLI 已不再暴露旧版 `tool/tools/workspace/send` 命令。
+    2. 因此动态工具发现/调用会在不兼容版本下优雅降级。
+    3. 工作区文件读写改为直接访问 `~/.openclaw/workspace`。
     """
 
     def __init__(self):
         self._ws_url = "ws://localhost:18789"
         self._available_tools: Dict[str, Dict] = {}
         self._openclaw_bin = self._find_openclaw()
+        self._supported_commands = self._discover_cli_commands()
+        self._workspace_dir = Path.home() / ".openclaw" / "workspace"
 
     def _find_openclaw(self) -> Optional[str]:
         """查找 OpenClaw CLI 二进制"""
         import shutil
+
         for name in ["openclaw", "claw"]:
             path = shutil.which(name)
             if path:
                 return path
         return None
+
+    def _discover_cli_commands(self) -> Set[str]:
+        """探测当前 OpenClaw CLI 暴露的顶层命令。"""
+        if not self._openclaw_bin:
+            return set()
+
+        try:
+            proc = subprocess.run(
+                [self._openclaw_bin, "--help"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except Exception:
+            return set()
+
+        commands: Set[str] = set()
+        in_commands = False
+        for line in (proc.stdout or "").splitlines():
+            stripped = line.strip()
+            if stripped == "Commands:":
+                in_commands = True
+                continue
+            if not in_commands:
+                continue
+            if stripped.startswith("Examples:") or stripped.startswith("Docs:"):
+                break
+            if not stripped or stripped.startswith("Hint:"):
+                continue
+            command = stripped.split()[0].rstrip("*")
+            if command:
+                commands.add(command)
+        return commands
+
+    def _supports_legacy_tool_cli(self) -> bool:
+        """旧版 tool/tools CLI 是否可用。"""
+        return any(cmd in self._supported_commands for cmd in ("tool", "tools"))
 
     @property
     def is_available(self) -> bool:
@@ -54,21 +94,32 @@ class OpenClawBridge:
     # ──────── 工具发现 ────────
 
     async def discover_tools(self) -> List[Dict[str, Any]]:
-        """从 OpenClaw 获取可用工具列表 (tools/list)"""
+        """从 OpenClaw 获取可用工具列表 (旧版 tools/list)。"""
         if not self.is_available:
             logger.warning("OpenClaw CLI 未找到，跳过工具发现")
             return []
 
-        try:
-            result = await self._run_cli(["tools", "list", "--json"])
-            if result:
-                tools = json.loads(result)
-                self._available_tools = {t["name"]: t for t in tools}
-                logger.info(f"从 OpenClaw 发现 {len(tools)} 个工具")
-                return tools
-        except Exception as e:
-            logger.warning(f"OpenClaw 工具发现失败: {e}")
+        if not self._supports_legacy_tool_cli():
+            logger.info(
+                "OpenClaw CLI 存在，但当前版本未暴露旧版 tool/tools 命令；"
+                "跳过动态工具发现，AOS 继续以降级模式运行"
+            )
+            return []
 
+        last_error: Optional[Exception] = None
+        for args in (["tools", "list", "--json"], ["tool", "list", "--json"]):
+            try:
+                result = await self._run_cli(args)
+                if result:
+                    tools = json.loads(result)
+                    self._available_tools = {t["name"]: t for t in tools}
+                    logger.info(f"从 OpenClaw 发现 {len(tools)} 个工具")
+                    return tools
+            except Exception as exc:
+                last_error = exc
+
+        if last_error is not None:
+            logger.warning(f"OpenClaw 工具发现失败: {last_error}")
         return []
 
     # ──────── 工具调用 ────────
@@ -78,14 +129,10 @@ class OpenClawBridge:
         tool_name: str,
         arguments: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
-        """调用 OpenClaw 的工具 (tools/call)
+        """调用 OpenClaw 的工具 (旧版 tools/call)。
 
-        Args:
-            tool_name: 工具名（如 "Read File", "Search Web" 等）
-            arguments: 工具参数
-
-        Returns:
-            {"success": bool, "result": Any, "error": str | None}
+        当前 OpenClaw 版本如果未暴露旧版 tool/tools 命令，则返回明确的
+        不支持错误，避免抛出误导性的 CLI 异常。
         """
         if not self.is_available:
             return {
@@ -94,30 +141,43 @@ class OpenClawBridge:
                 "error": "OpenClaw 未安装或不在 PATH 中",
             }
 
-        try:
-            args_json = json.dumps(arguments or {}, ensure_ascii=False)
-            result = await self._run_cli([
-                "tool", "call", tool_name,
-                "--args", args_json,
-                "--json",
-            ])
-            if result:
-                return {
-                    "success": True,
-                    "result": json.loads(result),
-                    "error": None,
-                }
-            return {
-                "success": True,
-                "result": result,
-                "error": None,
-            }
-        except Exception as e:
+        if not self._supports_legacy_tool_cli():
             return {
                 "success": False,
                 "result": None,
-                "error": str(e),
+                "error": (
+                    "当前 OpenClaw CLI 版本未暴露旧版 tool/tools 命令，"
+                    "AOS 的动态外部工具调用已自动降级"
+                ),
             }
+
+        args_json = json.dumps(arguments or {}, ensure_ascii=False)
+        last_error: Optional[Exception] = None
+        for args in (
+            ["tool", "call", tool_name, "--args", args_json, "--json"],
+            ["tools", "call", tool_name, "--args", args_json, "--json"],
+        ):
+            try:
+                result = await self._run_cli(args)
+                if result:
+                    return {
+                        "success": True,
+                        "result": json.loads(result),
+                        "error": None,
+                    }
+                return {
+                    "success": True,
+                    "result": result,
+                    "error": None,
+                }
+            except Exception as exc:
+                last_error = exc
+
+        return {
+            "success": False,
+            "result": None,
+            "error": str(last_error) if last_error else "Unknown error",
+        }
 
     # ──────── 与 OpenClaw 会话交互 ────────
 
@@ -126,48 +186,44 @@ class OpenClawBridge:
         message: str,
         channel: str = "default",
     ) -> Optional[str]:
-        """通过 OpenClaw Gateway 向指定 Channel 发送消息
+        """通过 OpenClaw Gateway 向指定 Channel 发送消息。
 
-        这让 AOS 可以通过 OpenClaw 的消息通道（WhatsApp/Telegram/etc）
-        向用户发送通知。
+        新版 OpenClaw 使用 `message send`，但要求显式 target，当前桥接层
+        仅保留接口并在不兼容时返回 None。
         """
         if not self.is_available:
             return None
 
-        try:
-            return await self._run_cli([
-                "send", message,
-                "--channel", channel,
-                "--json",
-            ])
-        except Exception as e:
-            logger.error(f"发送到 OpenClaw Channel 失败: {e}")
+        if "message" not in self._supported_commands:
+            logger.info("当前 OpenClaw CLI 不支持消息发送桥接命令")
             return None
+
+        logger.info(
+            "当前桥接层缺少 message send 所需的显式 target 信息，"
+            f"跳过向 channel={channel} 发送消息"
+        )
+        return None
 
     async def read_workspace_file(self, filename: str) -> Optional[str]:
-        """读取 OpenClaw 工作区文件 (SOUL.md / AGENTS.md / USER.md 等)"""
-        if not self.is_available:
-            return None
-
+        """读取 OpenClaw 工作区文件 (SOUL.md / AGENTS.md / USER.md 等)。"""
+        path = self._workspace_dir / filename
         try:
-            return await self._run_cli(["workspace", "cat", filename])
+            if path.exists():
+                return path.read_text(encoding="utf-8")
         except Exception:
             return None
+        return None
 
     async def update_memory_md(self, content: str) -> bool:
-        """写入 OpenClaw 的 MEMORY.md（跨会话持久记忆）
-
-        AOS 将关键记忆同步到 OpenClaw 的原生记忆文件，
-        使得即使不通过 AOS 访问，OpenClaw Agent 也能看到这些信息。
-        """
-        if not self.is_available:
-            return False
-
+        """写入 OpenClaw 的 MEMORY.md（跨会话持久记忆）。"""
         try:
-            await self._run_cli([
-                "workspace", "append", "MEMORY.md",
-                "--content", content,
-            ])
+            self._workspace_dir.mkdir(parents=True, exist_ok=True)
+            path = self._workspace_dir / "MEMORY.md"
+            prefix = "" if not path.exists() or path.stat().st_size == 0 else "\n"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(prefix + content)
+                if not content.endswith("\n"):
+                    f.write("\n")
             return True
         except Exception as e:
             logger.error(f"更新 MEMORY.md 失败: {e}")
