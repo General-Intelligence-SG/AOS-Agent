@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/general-intelligence-sg-aos-agent-badge.png)](https://mseep.ai/app/general-intelligence-sg-aos-agent)
+
 # AOS 奥思 — 企业级虚拟助理 PoC
 
 > 基于 OpenClaw 构建的多 Agent 协作虚拟助理平台
